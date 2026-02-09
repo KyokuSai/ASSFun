@@ -1,5 +1,10 @@
+from __future__ import annotations
+from dataclasses import dataclass, field
+import mimetypes
 from pathlib import Path
-from tkinterdnd2 import TkinterDnD, DND_ALL
+from tkinter import filedialog, messagebox
+from typing import Any, Literal, Mapping, Sequence
+from tkinterdnd2 import DND_FILES, TkinterDnD, DND_ALL
 import customtkinter as ctk
 import tkinter
 import re, json
@@ -45,6 +50,52 @@ def resource_path(relative_path):
     except Exception:
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
+
+
+def _pick_default_track(tracks, track_type):
+    candidates = [t for t in tracks if t.track_type == track_type]
+    if not candidates:
+        return None
+    for t in candidates:
+        if getattr(t, "default", "").lower() == "yes":
+            return t
+    return candidates[0]
+
+
+def get_media_info(path: str) -> dict:
+    try:
+        media_info = MediaInfo.parse(path)
+    except:
+        raise RuntimeError(
+            "MediaInfo 未安装或无法加载。\n"
+            "请先安装系统级 MediaInfo（CLI 或 GUI），并确保 mediainfo 在 PATH 中。"
+        )
+
+    tracks = media_info.tracks
+
+    video = _pick_default_track(tracks, "Video")
+    audio = _pick_default_track(tracks, "Audio")
+    width = None
+    height = None
+    video_codec = None
+    audio_codec = None
+    bit_depth = None
+
+    if video:
+        width = video.width
+        height = video.height
+        video_codec: str = video.format
+        bit_depth = video.bit_depth
+    if audio:
+        audio_codec: str = audio.format
+
+    return {
+        "width": width,
+        "height": height,
+        "vcodec": video_codec,
+        "acodec": audio_codec,
+        "bitdepth": bit_depth,
+    }
 
 
 # 开关
@@ -211,24 +262,24 @@ class ConfigWindowFrame(ctk.CTkScrollableFrame):
 
         _options = {
             "mkvmerge_path": "mkvmerge路径(安装mkvtoolnix的同目录下)",
-            "filename_ext": "混流输出文件的视频属性标识，用{res}代表视频轨垂直分辨率",
+            "filename_ext": "混流输出文件的视频属性标识\n用{height}代表视频垂直分辨率，还可以使用{vcodec}、{bitdepth}、{acodec}",
             "mkvoutputdir": "混流输出文件的路径(留空则与输入文件同目录)",
+            "cover": "是否要选择封入封面图片",
             "videotrack_lang": "混流视频轨道的语言设置(中文为zh日文为ja)",
             "videotrack_name": "混流视频轨道的名称",
             "audiotrack_lang": "混流音频轨道的语言设置(中文为zh日文为ja)",
             "audiotrack_name": "混流音频轨道的名称",
-            "audiotrack_delay": "混流音频轨道的延迟(0则无延迟)",
             "asschsjpntrack_symbol": "混流字幕轨道判定为简中/简日的标识符",
-            "asschsjpntrack_lang": "[简中/简日]混流字幕轨道的语言(中文为zh日文为ja)",
+            # "asschsjpntrack_lang": "[简中/简日]混流字幕轨道的语言(中文为zh日文为ja)",
             "asschsjpntrack_name": "[简中/简日]混流字幕轨道的名称",
             "asschtjpntrack_symbol": "混流字幕轨道判定为繁中/繁日的标识符",
-            "asschtjpntrack_lang": "[繁中/繁日]混流字幕轨道的语言(中文为zh日文为ja)",
+            # "asschtjpntrack_lang": "[繁中/繁日]混流字幕轨道的语言(中文为zh日文为ja)",
             "asschtjpntrack_name": "[繁中/繁日]混流字幕轨道的名称",
             "assjpntrack_symbol": "混流字幕轨道判定为日文的标识符",
-            "assjpntrack_lang": "[日本語]混流字幕轨道的语言(中文为zh日文为ja)",
+            # "assjpntrack_lang": "[日本語]混流字幕轨道的语言(中文为zh日文为ja)",
             "assjpntrack_name": "[日本語]混流字幕轨道的名称",
             "assengtrack_symbol": "混流字幕轨道判定为英文的标识符",
-            "assengtrack_lang": "[ENG]混流字幕轨道的语言(英文为en)",
+            # "assengtrack_lang": "[ENG]混流字幕轨道的语言(英文为en)",
             "assengtrack_name": "[ENG]混流字幕轨道的名称",
             "asstrackname_separator": "混流字幕轨道名称分割符\n(在字幕文件名有.style.ass时在名称后添加/分割符style/)",
             "assmultistyle_defaulttrack": "混流字幕轨道有多style时判定默认轨道的style名",
@@ -452,6 +503,809 @@ class SelectWindow(ctk.CTkToplevel):
     def get_result(self):
         self.master.wait_window(self)
         return self.result
+
+
+MediaKind = Literal["av", "video", "audio"]
+
+
+@dataclass(frozen=True, slots=True)
+class TrackRule:
+    """
+    覆写规则。
+
+    index:
+      - 相对序号：仅在同类型轨道内计数，从 0 开始。
+        例如：视频轨 2 条 -> index=0,1；音频轨 3 条 -> index=0,1,2。
+    default:
+      - None：不覆写，继承源文件该轨 default_track 标记
+      - True/False：显式覆写该轨 default_track
+    delay_ms:
+      - mkvmerge --sync 使用毫秒；可为负数
+    """
+
+    index: int
+    language: str | None = None
+    name: str | None = None
+    delay_ms: int | None = None
+    default: bool | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MediaInputSpec:
+    """
+    音视频输入文件规范。
+
+    kind:
+      - "av"    : 混入视频轨 + 音频轨
+      - "video" : 只混入视频轨
+      - "audio" : 只混入音频轨
+
+    select_*:
+      - None：混入该类型的所有轨道
+      - [0,2,...]：仅混入这些相对序号对应的轨道
+
+    *_rules:
+      - 对指定轨道覆写 language/name/delay/default
+      - 若 select_* 非 None，则 rules 的 index 必须包含在 select_* 中
+    """
+
+    path: str | Path
+    kind: MediaKind = "av"
+
+    select_video: Sequence[int] | None = None
+    select_audio: Sequence[int] | None = None
+
+    video_rules: Sequence[TrackRule] = field(default_factory=tuple)
+    audio_rules: Sequence[TrackRule] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True, slots=True)
+class SubtitleInputSpec:
+    """
+    字幕输入文件规范。
+
+    select:
+      - None：混入该文件全部字幕轨
+      - [0,1,...]：仅混入这些字幕轨（相对序号，按 subtitles 类型内计数）
+
+    rules:
+      - 覆写对应字幕轨的 language/name/default/delay
+      - 若 select 非 None，则 rules.index 必须包含在 select 内
+    """
+
+    path: str | Path
+    select: Sequence[int] | None = None
+    rules: Sequence[TrackRule] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True, slots=True)
+class FontAttachmentSpec:
+    """字体附件（ttf/otf/ttc...）"""
+
+    path: str | Path
+    name: str | None = None  # 附件名；不填则用原文件名
+
+
+@dataclass(frozen=True, slots=True)
+class CoverAttachmentSpec:
+    """封面附件（jpg/png/webp...）"""
+
+    path: str | Path
+    name: str | None = None  # 默认 cover.xxx
+    description: str = "cover"  # mkvmerge --attachment-description
+
+
+@dataclass(slots=True)
+class MuxPlan:
+    inputs: list[MediaInputSpec] = field(default_factory=list)
+    subtitles: list[SubtitleInputSpec] = field(default_factory=list)
+    fonts: list[FontAttachmentSpec] = field(default_factory=list)
+
+    cover: CoverAttachmentSpec | None = None
+    title: str | None = None
+    output: Path | None = None
+    ui_language: str = "zh_CN"
+
+    def clear(self) -> None:
+        self.inputs.clear()
+        self.subtitles.clear()
+        self.fonts.clear()
+        self.cover = None
+        self.title = None
+        self.output = None
+        self.ui_language = "zh_CN"
+
+    def clone(self) -> "MuxPlan":
+        p = MuxPlan()
+        p.inputs = list(self.inputs)
+        p.subtitles = list(self.subtitles)
+        p.fonts = list(self.fonts)
+        p.cover = self.cover
+        p.title = self.title
+        p.output = self.output
+        p.ui_language = self.ui_language
+        return p
+
+
+@dataclass(slots=True)
+class _ResolvedTrack:
+    track_id: int
+    rel_index: int
+    inherited_default: bool
+    desired_default: bool
+    default_explicit: bool  # True 表示由 rule.default 或默认强制决定
+    language: str | None
+    name: str | None
+    delay_ms: int | None
+
+
+@dataclass(slots=True)
+class _ResolvedInput:
+    path: Path
+    kind: MediaKind
+    video_tracks: list[_ResolvedTrack]
+    audio_tracks: list[_ResolvedTrack]
+
+
+@dataclass(slots=True)
+class _ResolvedSubtitle:
+    path: Path
+    subs_tracks: list[_ResolvedTrack]
+
+
+class MkvMergeMuxer:
+    def __init__(self, mkvmerge_path: str | None = None) -> None:
+        self.mkvmerge = (
+            mkvmerge_path or shutil.which("mkvmerge") or shutil.which("mkvmerge.exe")
+        )
+        if not self.mkvmerge:
+            raise FileNotFoundError("未找到 mkvmerge。")
+        self._plan = MuxPlan()
+
+    def clear_plan(self) -> "MkvMergeMuxer":
+        self._plan.clear()
+        return self
+
+    def add(
+        self,
+        *,
+        clear: bool = False,
+        inputs: MediaInputSpec | Sequence[MediaInputSpec] | None = None,
+        subtitles: SubtitleInputSpec | Sequence[SubtitleInputSpec] | None = None,
+        fonts: FontAttachmentSpec | Sequence[FontAttachmentSpec] | None = None,
+        cover: CoverAttachmentSpec | None = None,
+        title: str | None = None,
+        output: str | Path | None = None,
+        ui_language: str | None = None,
+    ) -> "MkvMergeMuxer":
+        if clear:
+            self._plan.clear()
+
+        def _extend_list(dst: list, x: Any) -> None:
+            if x is None:
+                return
+            if isinstance(x, Sequence) and not isinstance(x, (str, bytes, Path)):
+                dst.extend(x)
+            else:
+                dst.append(x)
+
+        _extend_list(self._plan.inputs, inputs)
+        _extend_list(self._plan.subtitles, subtitles)
+        _extend_list(self._plan.fonts, fonts)
+
+        if cover is not None:
+            self._plan.cover = cover
+        if title is not None:
+            self._plan.title = title
+        if output is not None:
+            self._plan.output = Path(output)
+        if ui_language is not None:
+            self._plan.ui_language = ui_language
+
+        return self
+
+    def _run(self, args: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(args, text=True, capture_output=True, check=False)
+
+    def _probe_tracks_json(self, media_path: Path) -> dict[str, Any]:
+        cp = self._run([self.mkvmerge, "-J", str(media_path)])
+        if cp.returncode != 0:
+            raise RuntimeError(
+                f"mkvmerge -J 读取失败：{media_path}\n"
+                f"ExitCode={cp.returncode}\nSTDERR:\n{cp.stderr.strip()}\nSTDOUT:\n{cp.stdout.strip()}"
+            )
+        try:
+            return json.loads(cp.stdout)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"无法解析 mkvmerge -J 输出为 JSON：{media_path}\n{e}")
+
+    @staticmethod
+    def _iter_enabled_tracks(
+        probe: Mapping[str, Any], want_type: str
+    ) -> list[dict[str, Any]]:
+        """
+        want_type: "video" | "audio" | "subtitles"
+        返回按 mkvmerge JSON 顺序出现的 enabled 轨道列表。
+        """
+        tracks = probe.get("tracks", []) or []
+        out: list[dict[str, Any]] = []
+        for t in tracks:
+            if t.get("type") != want_type:
+                continue
+            props = t.get("properties", {}) or {}
+            enabled = props.get("enabled_track", True)
+            if enabled is False:
+                continue
+            out.append(t)
+        return out
+
+    @staticmethod
+    def _track_id(t: Mapping[str, Any]) -> int:
+        return int(t.get("id"))
+
+    @staticmethod
+    def _track_inherited_default(t: Mapping[str, Any]) -> bool:
+        props = t.get("properties", {}) or {}
+        return props.get("default_track") is True
+
+    @staticmethod
+    def _make_rules_map(rules: Sequence[TrackRule]) -> dict[int, TrackRule]:
+        m: dict[int, TrackRule] = {}
+        for r in rules:
+            if r.index < 0:
+                raise ValueError(f"TrackRule.index 必须 >= 0：{r.index}")
+            if r.index in m:
+                raise ValueError(f"重复的 TrackRule.index：{r.index}")
+            m[r.index] = r
+        return m
+
+    @staticmethod
+    def _normalize_select(select: Sequence[int] | None, max_count: int) -> list[int]:
+        if select is None:
+            return list(range(max_count))
+        uniq: list[int] = []
+        seen: set[int] = set()
+        for i in select:
+            if i in seen:
+                continue
+            seen.add(i)
+            uniq.append(i)
+        for i in uniq:
+            if i < 0 or i >= max_count:
+                raise ValueError(f"选择的轨道序号越界：{i} (有效范围 0..{max_count-1})")
+        return sorted(uniq)
+
+    def _resolve_tracks_of_type(
+        self,
+        probe: Mapping[str, Any],
+        want_type: Literal["video", "audio", "subtitles"],
+        select: Sequence[int] | None,
+        rules: Sequence[TrackRule],
+        *,
+        require_non_empty: bool,
+        debug_label: str,
+    ) -> list[_ResolvedTrack]:
+        tracks = self._iter_enabled_tracks(probe, want_type)
+        if require_non_empty and not tracks:
+            raise ValueError(f"{debug_label}：找不到 {want_type} 轨道。")
+
+        rules_map = self._make_rules_map(rules)
+        selected = self._normalize_select(select, len(tracks))
+
+        if select is not None:
+            sel_set = set(selected)
+            for idx in rules_map:
+                if idx not in sel_set:
+                    raise ValueError(
+                        f"{debug_label}：TrackRule.index={idx} 未包含在 select 中；"
+                        "为避免误写，rules 只能覆写已选择的轨道。"
+                    )
+
+        resolved: list[_ResolvedTrack] = []
+        for rel_idx in selected:
+            t = tracks[rel_idx]
+            tid = self._track_id(t)
+            inherited_def = self._track_inherited_default(t)
+
+            rule = rules_map.get(rel_idx)
+            lang = rule.language if rule else None
+            name = rule.name if rule else None
+            delay = rule.delay_ms if rule else None
+
+            if rule is None or rule.default is None:
+                desired_def = inherited_def
+                explicit = False
+            else:
+                desired_def = bool(rule.default)
+                explicit = True
+
+            resolved.append(
+                _ResolvedTrack(
+                    track_id=tid,
+                    rel_index=rel_idx,
+                    inherited_default=inherited_def,
+                    desired_default=desired_def,
+                    default_explicit=explicit,
+                    language=lang,
+                    name=name,
+                    delay_ms=delay,
+                )
+            )
+        return resolved
+
+    @staticmethod
+    def _guess_cover_mime(path: Path) -> str:
+        mime, _ = mimetypes.guess_type(str(path))
+        return mime or "image/jpeg"
+
+    @staticmethod
+    def _guess_font_mime(path: Path) -> str:
+        ext = path.suffix.lower()
+        if ext in (".ttf", ".ttc"):
+            return "application/x-truetype-font"
+        if ext == ".otf":
+            return "application/vnd.ms-opentype"
+        mime, _ = mimetypes.guess_type(str(path))
+        return mime or "application/octet-stream"
+
+    @staticmethod
+    def _csv_track_ids(tracks: Sequence[_ResolvedTrack]) -> str:
+        return ",".join(str(t.track_id) for t in tracks)
+
+    def _apply_default_fallbacks(
+        self,
+        resolved_inputs: Sequence[_ResolvedInput],
+    ) -> None:
+        """
+        如果合成后没有默认视频轨 / 默认音频轨，则强制把全局第一条设为 default=yes。
+        - 全局第一条按输入顺序、文件内相对序号顺序决定。
+        """
+        # collect in stable order
+        all_video: list[_ResolvedTrack] = []
+        all_audio: list[_ResolvedTrack] = []
+
+        for inp in resolved_inputs:
+            if inp.kind in ("av", "video"):
+                all_video.extend(inp.video_tracks)
+            if inp.kind in ("av", "audio"):
+                all_audio.extend(inp.audio_tracks)
+
+        if all_video and not any(t.desired_default for t in all_video):
+            t0 = all_video[0]
+            t0.desired_default = True
+            t0.default_explicit = True  # 强制输出 --default-track
+
+        if all_audio and not any(t.desired_default for t in all_audio):
+            t0 = all_audio[0]
+            t0.desired_default = True
+            t0.default_explicit = True
+
+    def _build_track_overrides_args(
+        self, tracks: Sequence[_ResolvedTrack]
+    ) -> list[str]:
+        """
+        对单个输入文件的轨道覆写参数（language/name/delay/default）。
+        仅在需要时输出对应 mkvmerge 参数，减少冗余。
+        """
+        args: list[str] = []
+        for t in tracks:
+            if t.language:
+                args += ["--language", f"{t.track_id}:{t.language}"]
+            if t.name is not None:
+                args += ["--track-name", f"{t.track_id}:{t.name}"]
+            if t.delay_ms is not None:
+                args += ["--sync", f"{t.track_id}:{t.delay_ms}"]
+            if t.default_explicit:
+                args += [
+                    "--default-track",
+                    f"{t.track_id}:{'yes' if t.desired_default else 'no'}",
+                ]
+        return args
+
+    def _build_media_input_args(self, inp: _ResolvedInput) -> list[str]:
+        args: list[str] = [
+            "--no-subtitles",
+            "--no-attachments",
+            "--no-chapters",
+            "--no-track-tags",
+            "--no-global-tags",
+        ]
+
+        # tracks include switches
+        if inp.kind == "video":
+            args += ["--no-audio"]
+        elif inp.kind == "audio":
+            args += ["--no-video"]
+
+        # video selection
+        if inp.kind in ("av", "video"):
+            if inp.video_tracks:
+                args += ["--video-tracks", self._csv_track_ids(inp.video_tracks)]
+            else:
+                # 对于要求必须有视频轨的 kind，这里应该早已在 resolve 阶段抛错
+                args += ["--no-video"]
+
+        # audio selection
+        if inp.kind in ("av", "audio"):
+            if inp.audio_tracks:
+                args += ["--audio-tracks", self._csv_track_ids(inp.audio_tracks)]
+            else:
+                args += ["--no-audio"]
+
+        # per-track overrides
+        args += self._build_track_overrides_args(inp.video_tracks)
+        args += self._build_track_overrides_args(inp.audio_tracks)
+
+        # file path at the end
+        args.append(str(inp.path))
+        return args
+
+    def _build_subtitle_input_args(self, sub: _ResolvedSubtitle) -> list[str]:
+        args: list[str] = [
+            "--no-video",
+            "--no-audio",
+            "--no-attachments",
+            "--no-chapters",
+            "--no-track-tags",
+            "--no-global-tags",
+        ]
+        if sub.subs_tracks:
+            args += ["--subtitle-tracks", self._csv_track_ids(sub.subs_tracks)]
+        else:
+            pass
+
+        args += self._build_track_overrides_args(sub.subs_tracks)
+        args.append(str(sub.path))
+        return args
+
+    def mux(
+        self,
+        *,
+        inputs: Sequence[MediaInputSpec] | None = None,
+        output: str | Path | None = None,
+        title: str | None = None,
+        subtitles: Sequence[SubtitleInputSpec] | None = None,
+        fonts: Sequence[FontAttachmentSpec] | None = None,
+        cover: CoverAttachmentSpec | None = None,
+        ui_language: str | None = None,
+    ) -> Path:
+        plan = self._plan.clone()
+
+        if inputs is not None:
+            plan.inputs = list(inputs)
+        if subtitles is not None:
+            plan.subtitles = list(subtitles)
+        if fonts is not None:
+            plan.fonts = list(fonts)
+        if cover is not None:
+            plan.cover = cover
+        if title is not None:
+            plan.title = title
+        if output is not None:
+            plan.output = Path(output)
+        if ui_language is not None:
+            plan.ui_language = ui_language
+
+        if not plan.inputs:
+            raise ValueError(
+                "未指定 inputs：请通过 add(inputs=...) 或 mux(inputs=...) 提供至少一个输入。"
+            )
+        if plan.output is None:
+            raise ValueError(
+                "未指定 output：请通过 add(output=...) 或 mux(output=...) 指定输出路径。"
+            )
+
+        out = plan.output
+        out.parent.mkdir(parents=True, exist_ok=True)
+
+        # ---- resolve media inputs ----
+        resolved_inputs: list[_ResolvedInput] = []
+        for i, spec in enumerate(plan.inputs):
+            p = Path(spec.path)
+            if not p.exists():
+                raise FileNotFoundError(f"输入文件不存在：{p}")
+
+            probe = self._probe_tracks_json(p)
+            label = f"[inputs[{i}] {p.name}]"
+
+            need_video = spec.kind in ("av", "video")
+            need_audio = spec.kind in ("av", "audio")
+
+            v_tracks = self._resolve_tracks_of_type(
+                probe,
+                "video",
+                spec.select_video,
+                spec.video_rules,
+                require_non_empty=need_video,
+                debug_label=label,
+            )
+            a_tracks = self._resolve_tracks_of_type(
+                probe,
+                "audio",
+                spec.select_audio,
+                spec.audio_rules,
+                require_non_empty=need_audio,
+                debug_label=label,
+            )
+
+            resolved_inputs.append(
+                _ResolvedInput(
+                    path=p, kind=spec.kind, video_tracks=v_tracks, audio_tracks=a_tracks
+                )
+            )
+
+        self._apply_default_fallbacks(resolved_inputs)
+
+        # ---- resolve subtitles ----
+        resolved_subs: list[_ResolvedSubtitle] = []
+        for i, s in enumerate(plan.subtitles):
+            p = Path(s.path)
+            if not p.exists():
+                raise FileNotFoundError(f"字幕文件不存在：{p}")
+            probe = self._probe_tracks_json(p)
+            label = f"[subtitles[{i}] {p.name}]"
+            subs_tracks = self._resolve_tracks_of_type(
+                probe,
+                "subtitles",
+                s.select,
+                s.rules,
+                require_non_empty=True,
+                debug_label=label,
+            )
+            resolved_subs.append(_ResolvedSubtitle(path=p, subs_tracks=subs_tracks))
+
+        # ---- build mkvmerge cmd ----
+        cmd: list[str] = [
+            self.mkvmerge,
+            "--ui-language",
+            plan.ui_language,
+            "--priority",
+            "lower",
+            "-o",
+            str(out),
+        ]
+        if plan.title is not None:
+            cmd += ["--title", plan.title]
+
+        for inp in resolved_inputs:
+            cmd += self._build_media_input_args(inp)
+        for sub in resolved_subs:
+            cmd += self._build_subtitle_input_args(sub)
+
+        # cover attachment
+        if plan.cover is not None:
+            cpath = Path(plan.cover.path)
+            if not cpath.exists():
+                raise FileNotFoundError(f"封面文件不存在：{cpath}")
+            mime = self._guess_cover_mime(cpath)
+            attach_name = plan.cover.name or f"cover{cpath.suffix.lower() or '.jpg'}"
+            cmd += [
+                "--attachment-name",
+                attach_name,
+                "--attachment-mime-type",
+                mime,
+                "--attachment-description",
+                plan.cover.description,
+                "--attach-file",
+                str(cpath),
+            ]
+
+        # font attachments
+        for f in plan.fonts:
+            fpath = Path(f.path)
+            if not fpath.exists():
+                raise FileNotFoundError(f"字体文件不存在：{fpath}")
+            mime = self._guess_font_mime(fpath)
+            attach_name = f.name or fpath.name
+            cmd += [
+                "--attachment-name",
+                attach_name,
+                "--attachment-mime-type",
+                mime,
+                "--attach-file",
+                str(fpath),
+            ]
+
+        cp = self._run(cmd)
+        if cp.returncode != 0:
+            raise RuntimeError(
+                "mkvmerge 混流失败。\n"
+                f"ExitCode={cp.returncode}\n"
+                f"STDERR:\n{cp.stderr.strip()}\n"
+                f"STDOUT:\n{cp.stdout.strip()}\n"
+            )
+        return out
+
+
+class FileDialog:
+    def __init__(
+        self,
+        parent: tkinter.Misc,
+        *,
+        title: str,
+        mode: str = "file",  # "file" or "dir"
+        exts: list[str] | None = None,  # e.g. [".mp4", ".mkv"] in file mode
+        multiple: bool = False,
+        topmost: bool = True,
+        auto_accept: bool = True,  # accept immediately after valid selection
+        size: tuple[int, int] = (480, 180),
+    ):
+        self.parent = parent
+        self.title = title
+        self.mode = mode
+        self.exts = exts
+        self.multiple = multiple
+        self.topmost = topmost
+        self.auto_accept = auto_accept
+        self.size = size
+
+        self._value = None  # str | list[str] | None
+        self._font = ctk.CTkFont(family="NotoSansSC-Medium", size=18, weight="normal")
+
+    def show(self):
+        win = ctk.CTkToplevel(self.parent)
+        win.title(self.title)
+        win.resizable(False, False)
+        ctk.set_appearance_mode("dark")
+        win.after(250, lambda: win.iconbitmap(resource_path("favicon.ico")))
+
+        if self.topmost:
+            win.attributes("-topmost", True)
+
+        win.grid_columnconfigure(0, weight=1)
+        win.grid_rowconfigure(0, weight=1)
+        win.grid_rowconfigure(1, weight=0)
+
+        body = ctk.CTkFrame(win, corner_radius=14)
+        body.grid(row=0, column=0, sticky="nsew", padx=8, pady=(10, 10))
+
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_rowconfigure(0, weight=1)
+
+        drop_area = ctk.CTkFrame(body, corner_radius=14, fg_color="transparent")
+        drop_area.grid(row=0, column=0, sticky="nsew", padx=4, pady=2)
+
+        drop_area.grid_columnconfigure(0, weight=1)
+
+        self._textbox = ctk.CTkTextbox(
+            drop_area, font=self._font, fg_color="transparent"
+        )
+        self._textbox.grid(row=0, column=0, sticky="nsew", padx=4, pady=(0, 12))
+        self._set_textbox("尚未选择。")
+
+        btn_row = ctk.CTkFrame(win, fg_color="transparent")
+        btn_row.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
+
+        btn_row.grid_columnconfigure(0, weight=0)
+        btn_row.grid_columnconfigure(1, weight=0)
+        btn_row.grid_columnconfigure(2, weight=1)
+        btn_row.grid_columnconfigure(3, weight=0)
+
+        btn_choose = ctk.CTkButton(
+            btn_row,
+            text="选择…",
+            fg_color="#E7285E",
+            command=lambda: self._pick_via_dialog(win),
+            font=self._font,
+        )
+        btn_choose.grid(row=0, column=0, sticky="w")
+
+        if not self.auto_accept:
+            btn_clear = ctk.CTkButton(
+                btn_row,
+                text="清空",
+                fg_color="#333333",
+                command=self._clear_selection,
+                font=self._font,
+            )
+            btn_clear.grid(row=0, column=1, sticky="w", padx=(10, 0))
+
+            btn_cancel = ctk.CTkButton(
+                btn_row,
+                text="取消并退出",
+                fg_color="#920000",
+                command=lambda: self._cancel(win),
+                font=self._font,
+            )
+            btn_cancel.grid(row=0, column=3, sticky="e")
+
+        win.drop_target_register(DND_FILES)
+        win.dnd_bind("<<Drop>>", lambda e: self._on_drop(e, win))
+
+        win.grab_set()
+        win.wait_window()
+
+        return self._value
+
+    def _set_textbox(self, text: str) -> None:
+        self._textbox.configure(state="normal")
+        self._textbox.delete("1.0", "end")
+        self._textbox.insert("1.0", text)
+        self._textbox.configure(state="disabled")
+
+    def _clear_selection(self) -> None:
+        self._value = None
+        self._set_textbox("尚未选择。")
+
+    def _cancel(self, win: tkinter.Toplevel) -> None:
+        self._value = None
+        win.destroy()
+
+    def _validate(self, paths: list[str]) -> str | None:
+        if not paths:
+            return "未接收到任何路径。"
+
+        check = paths if self.multiple else [paths[0]]
+
+        if self.mode == "dir":
+            for p in check:
+                if not os.path.isdir(p):
+                    return f"需要文件夹，但收到的不是文件夹：\n{p}"
+            return None
+
+        for p in check:
+            if not os.path.isfile(p):
+                return f"需要文件，但收到的不是文件：\n{p}"
+            if self.exts:
+                ext = Path(p).suffix.lower()
+                allowed = [e.lower() for e in self.exts]
+                if ext not in allowed:
+                    return f"文件类型不匹配：{ext}\n允许：{', '.join(self.exts)}\n文件：{p}"
+        return None
+
+    def _accept(self, win: tkinter.Toplevel, paths: list[str]) -> None:
+        err = self._validate(paths)
+        if err:
+            messagebox.showerror("无效输入", err, parent=win)
+            return
+
+        if self.multiple:
+            self._value = paths
+            preview = "\n".join(paths[:12])
+            if len(paths) > 12:
+                preview += f"\n…（共 {len(paths)} 项）"
+            self._set_textbox(preview)
+        else:
+            self._value = paths[0]
+            self._set_textbox(paths[0])
+
+        if self.auto_accept:
+            win.after(120, win.destroy)
+
+    def _on_drop(self, event, win: tkinter.Toplevel) -> None:
+        _files = event.data
+        matches = re.findall(r"\{(.*?)\}|([^\s]+)", event.data)
+        _files = [m[0] if m[0] else m[1] for m in matches]
+        if not _files:
+            return
+        self._accept(win, _files)
+
+    def _pick_via_dialog(self, win: tkinter.Toplevel) -> None:
+        if self.mode == "dir":
+            p = filedialog.askdirectory(title=self.title, parent=win)
+            if p:
+                self._accept(win, [p])
+            return
+
+        filetypes = None
+        if self.exts:
+            pattern = " ".join([f"*{e}" for e in self.exts])
+            filetypes = [("Allowed", pattern), ("All", "*.*")]
+        else:
+            filetypes = [("All", "*.*")]
+
+        if self.multiple:
+            paths = filedialog.askopenfilenames(
+                title=self.title, parent=win, filetypes=filetypes
+            )
+            if paths:
+                self._accept(win, list(paths))
+        else:
+            p = filedialog.askopenfilename(
+                title=self.title, parent=win, filetypes=filetypes
+            )
+            if p:
+                self._accept(win, [p])
 
 
 class ASSGenerate:
@@ -1115,8 +1969,9 @@ class ASSFunUI(Tk):
                 multiple=False,
             ),
         )
-        self.engbox.insert(ctk.END, "拖入单独英语字幕文件(如果有)")
+        self.engbox.insert(ctk.END, "字幕生成时额外添加英语字幕(如果有)")
         self.engbox.configure(state="disabled")
+        self.engbox.grid_remove()
         row = row + 1
 
         _check = Check(self, key="assgenerate", label="字幕生成", default=False)
@@ -1266,9 +2121,11 @@ class ASSFunUI(Tk):
         if len(self.files) == 1:
             self.assgenerate_check.toggle(master=self, value=True)
             self.assgenerate_check.getself().configure(state="normal")
+            self.engbox.grid()
         elif len(self.files) > 1:
             self.assgenerate_check.toggle(master=self, value=False)
             self.assgenerate_check.getself().configure(state="disabled")
+            self.engbox.grid_remove()
 
     def log(self, text: str):
         self.logbox.configure(state="normal")
@@ -1377,11 +2234,11 @@ class ASSFunUI(Tk):
     def initconfig(self, _return: bool = False):
         config = {
             "mkvmerge_path": "D:/path/to/mkvmerge.exe",
-            "filename_ext": "[{res}P][WEBRip][HEVC 10bit]",
+            "filename_ext": "[{height}P][WEBRip][{vcodec} {bitdepth}bit {acodec}]",
             "mkvoutputdir": "",
+            "cover": True,
             "videotrack_lang": "ja",
             "videotrack_name": "WEBRip by KyokuSaiYume",
-            "audiotrack_delay": "0",
             "audiotrack_lang": "ja",
             "audiotrack_name": "WEB-DL",
             "asschsjpntrack_symbol": "[CHS_JPN]",
@@ -1559,13 +2416,6 @@ class ASSFunUI(Tk):
         with open(outputpath, "w", encoding="utf-8-sig") as file:
             file.write(file_content)
 
-    def get_resolution(self, mkv: Path) -> tuple[int, int]:
-        media_info = MediaInfo.parse(mkv)
-        for track in media_info.tracks:
-            if track.track_type == "Video":
-                return track.width, track.height
-        return None, None
-
     # 开始
     def start(self):
         self.log(f"当前设置：{self.values}")
@@ -1579,6 +2429,18 @@ class ASSFunUI(Tk):
             self.log(f"读取字体……")
             self.generatecache()
             self.savecache()
+        # 选择封面图片
+        cover = None
+        if mkv and self.getconfig("cover"):
+            dlg = FileDialog(
+                self,
+                title="选择封面图片",
+                mode="file",
+                multiple=False,
+                auto_accept=True,
+                topmost=True,
+            )
+            cover = dlg.show()
         # 字幕生成
         if self.values["assgenerate"]:
             self.log("开始字幕生成")
@@ -1691,13 +2553,14 @@ class ASSFunUI(Tk):
         if mkv:
             self.asss = sorted(self.asss, key=lambda x: os.path.basename(x))
             self.log(f"开始自动混流")
-            mkvmerge_path = self.getconfig("mkvmerge_path")
+            mkvmerge_path: str = self.getconfig("mkvmerge_path")
             title = re.sub(r"\.mkv$", "", os.path.basename(mkv))
-            videotrack_resolution = self.get_resolution(mkv)
+            vinfo = get_media_info(mkv)
             filename_ext = self.getconfig("filename_ext")
-            filename_ext = re.sub(
-                r"\{res\}", str(videotrack_resolution[1]), filename_ext
-            )
+            filename_ext = re.sub(r"\{height\}", str(vinfo["height"]), filename_ext)
+            filename_ext = re.sub(r"\{vcodec\}", vinfo["vcodec"], filename_ext)
+            filename_ext = re.sub(r"\{bitdepth\}", str(vinfo["bitdepth"]), filename_ext)
+            filename_ext = re.sub(r"\{acodec\}", vinfo["acodec"], filename_ext)
             outputdir = self.getconfig("mkvoutputdir")
             if len(outputdir) == 0:
                 outputdir = os.path.dirname(mkv)
@@ -1708,7 +2571,6 @@ class ASSFunUI(Tk):
                 outputfile = f"{title}{filename_ext}.mkv"
             videotrack_lang: str = self.getconfig("videotrack_lang")
             videotrack_name: str = self.getconfig("videotrack_name")
-            audiotrack_delay: str = self.getconfig("audiotrack_delay")
             audiotrack_lang: str = self.getconfig("audiotrack_lang")
             audiotrack_name: str = self.getconfig("audiotrack_name")
             asschsjpntrack_symbol: str = self.getconfig("asschsjpntrack_symbol")
@@ -1727,13 +2589,14 @@ class ASSFunUI(Tk):
             assmultistyle_defaulttrack: str = self.getconfig(
                 "assmultistyle_defaulttrack"
             )
-            _select = SelectWindow(
-                self,
-                title="选择默认字幕样式",
-                selects=set().union(*(v.keys() for v in self.assstyles.values())),
-                default=assmultistyle_defaulttrack,
-            )
-            assmultistyle_defaulttrack = _select.get_result()
+            if self.values["assgenerate"]:
+                _select = SelectWindow(
+                    self,
+                    title="选择默认字幕样式",
+                    selects=set().union(*(v.keys() for v in self.assstyles.values())),
+                    default=assmultistyle_defaulttrack,
+                )
+                assmultistyle_defaulttrack = _select.get_result()
             fontsubset_warning: str = self.getconfig("fontsubset_warning")
             asstrack: dict[str, list[str, str]] = {
                 asschsjpntrack_symbol: [asschsjpntrack_lang, asschsjpntrack_name],
@@ -1742,55 +2605,93 @@ class ASSFunUI(Tk):
             }
             if len(self.eng) > 0:
                 asstrack[assengtrack_symbol] = [assengtrack_lang, assengtrack_name]
-            cmd = f'start "mkvmux" "{mkvmerge_path}" --ui-language zh_CN --priority lower '
-            cmd += f'--output ^"{outputdir}{outputfile}^" '
-            cmd += f"--no-subtitles --no-attachments "
-            cmd += f'--language 0:{videotrack_lang} --track-name ^"0:{videotrack_name}^" --display-dimensions 0:{videotrack_resolution[0]}x{videotrack_resolution[1]} '
-            if int(audiotrack_delay) == 0:
-                audiotrack_delay = ""
-            else:
-                audiotrack_delay = f"--sync 1:{audiotrack_delay} "
-            cmd += f'{audiotrack_delay}--language 1:{audiotrack_lang} --track-name ^"1:{audiotrack_name}^" ^"^(^" ^"{mkv}^" ^"^)^" '
-            asstrackorder = ""
-            for _index, ass in enumerate(self.asss):
-                asstrackorder += "," + str(_index + 1) + ":0"
+            muxer = MkvMergeMuxer(mkvmerge_path)
+            muxer.add(title=title)
+            muxer.add(output=f"{outputdir}{outputfile}")
+            muxer.add(ui_language="zh_CN")
+            muxer.add(
+                inputs=MediaInputSpec(
+                    mkv,
+                    video_rules=[
+                        TrackRule(0, videotrack_lang, videotrack_name, 0, True)
+                    ],
+                    audio_rules=[
+                        TrackRule(0, audiotrack_lang, audiotrack_name, None, True)
+                    ],
+                )
+            )
+            for ass in self.asss:
                 track_lang = "zh"
                 track_name = ""
-                track_isdefault = "--default-track-flag 0:no "
+                track_isdefault = False
                 for _symbol, _value in asstrack.items():
-                    if _symbol in os.path.basename(ass):
+                    if _symbol.lower() in os.path.basename(ass).lower():
                         track_lang = _value[0]
                         track_name = _value[1]
                         is_unique = sum(_symbol in str(_item) for _item in self.asss)
                         if is_unique < 2:
-                            track_isdefault = ""
+                            track_isdefault = True
+                if not track_name:
+                    for lang in ["zh", "ja", "en"]:
+                        _lang = [lang]
+                        if lang == "zh":
+                            _lang = ["zh", "ch", "sc", "tc"]
+                        if lang == "ja":
+                            _lang = ["ja", "jp"]
+                        if lang == "en":
+                            _lang = ["en"]
+                        if any(k in os.path.basename(ass).lower() for k in _lang):
+                            track_lang = _lang[0]
+                            track_isdefault = True
                 realtrack_name = track_name
-                assstyle = os.path.splitext(os.path.basename(ass))[0].split(".")
-                if len(assstyle) < 2:
-                    assstyle = ""
+                if self.values["assgenerate"]:
+                    assstyle = os.path.splitext(os.path.basename(ass))[0].split(".")
+                    if len(assstyle) < 2:
+                        assgenerate = ASSGenerate(self)
+                        assgenerate.readfile(Path(ass))
+                        assstyle = assgenerate.getstyle(assgenerate.assoriginal)
+                        assstyle = ""
+                    else:
+                        assstyle = assstyle[-1]
+                    if len(assstyle) != 0:
+                        realtrack_name = (
+                            f"{realtrack_name}{asstrackname_separator}{assstyle}"
+                        )
+                    if assmultistyle_defaulttrack == assstyle:
+                        track_isdefault = True
                 else:
-                    assstyle = assstyle[-1]
-                if len(assstyle) != 0:
-                    realtrack_name = (
-                        f"{realtrack_name}{asstrackname_separator}{assstyle}"
-                    )
-                if assmultistyle_defaulttrack == assstyle:
-                    track_isdefault = ""
+                    track_isdefault = True
                 if track_lang == assengtrack_symbol:
-                    track_isdefault = ""
-                cmd += f'--language 0:{track_lang} --track-name ^"0:{realtrack_name}^" {track_isdefault}^"^(^" ^"{ass}^" ^"^)^" '
+                    track_isdefault = True
+                muxer.add(
+                    subtitles=SubtitleInputSpec(
+                        ass,
+                        rules=[
+                            TrackRule(
+                                0, track_lang, realtrack_name, None, track_isdefault
+                            )
+                        ],
+                    )
+                )
             if not fontsubset_warning.endswith(" ") and not fontsubset_warning.endswith(
                 "-"
             ):
                 fontsubset_warning = f"{fontsubset_warning}-"
             for real_fontpath in real_fontpaths:
-                cmd += f'--attachment-name ^"{fontsubset_warning}{os.path.basename(real_fontpath)}^" --attachment-mime-type font/{os.path.splitext(real_fontpath)[1][1:].lower()} --attach-file ^"{real_fontpath}^" '
-            cmd += f'--title ^"{title}^" '
-            cmd += f"--track-order 0:0,0:1"  # 音视频轨道
-            cmd += asstrackorder  # 字幕轨道
-            self.log("混流命令：")
-            self.log(cmd)
-            os.system(cmd)
+                muxer.add(
+                    fonts=FontAttachmentSpec(
+                        real_fontpath,
+                        f"{fontsubset_warning}{os.path.basename(real_fontpath)}",
+                    )
+                )
+            print(f"cover: {cover}")
+            if cover:
+                muxer.add(cover=CoverAttachmentSpec(cover, "cover", title))
+            output = muxer.mux()
+            if Path(output).exists:
+                self.log(f"混流完成: {output}")
+            else:
+                self.log("※混流失败！")
         self.mkv = []
         self.mkvbox.configure(state="normal")
         self.mkvbox.delete(1.0, ctk.END)
