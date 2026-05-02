@@ -325,7 +325,7 @@ class ConfigWindow(ctk.CTkToplevel):
         super().__init__(master)
         self.geometry("800x600")
         self.minsize(800, 600)
-        self.title("ASSFont 设置 - KyokuSai")
+        self.title("ASSFun 设置 - KyokuSai")
         self.after(250, lambda: self.iconbitmap(resource_path("favicon.ico")))
         self.after(150, lambda: self.focus())
         self.font = master.font
@@ -705,7 +705,9 @@ class MkvMergeMuxer:
         return self
 
     def _run(self, args: list[str]) -> subprocess.CompletedProcess:
-        return subprocess.run(args, text=True, capture_output=True, check=False)
+        return subprocess.run(
+            args, text=True, capture_output=True, check=False, encoding="utf-8"
+        )
 
     def _probe_tracks_json(self, media_path: Path) -> dict[str, Any]:
         cp = self._run([self.mkvmerge, "-J", str(media_path)])
@@ -1881,7 +1883,7 @@ class ASSFunUI(Tk):
         ctk.set_appearance_mode("dark")
         self.geometry("600x500")
         self.minsize(600, 500)
-        self.title("ASSFont - KyokuSai")
+        self.title("ASSFun - KyokuSai")
         self.iconbitmap(resource_path("favicon.ico"))
 
         self.grid_columnconfigure([0, 1, 2], weight=1)
@@ -2684,7 +2686,6 @@ class ASSFunUI(Tk):
                         f"{fontsubset_warning}{os.path.basename(real_fontpath)}",
                     )
                 )
-            print(f"cover: {cover}")
             if cover:
                 muxer.add(cover=CoverAttachmentSpec(cover, "cover", title))
             output = muxer.mux()
