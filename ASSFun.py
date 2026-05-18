@@ -1272,27 +1272,59 @@ def show_main_window(window) -> None:
     focus_existing_toplevel(window, force_later=False)
 
 
-def set_pointer_cursor(widget, cursor: str = "hand2") -> None:
-    def apply(target, value: str) -> None:
-        try:
-            target.configure(cursor=value)
-            return
-        except Exception:
-            pass
-        for attr in ("canvas", "_canvas", "_text_label", "_bg_canvas"):
-            child = getattr(target, attr, None)
-            if child is not None:
-                try:
-                    child.configure(cursor=value)
-                except Exception:
-                    pass
+DISABLED_CURSOR = ""
 
+
+def _widget_is_interactive(widget: tkinter.Misc) -> bool:
     try:
-        widget.bind("<Enter>", lambda _event: apply(widget, cursor), add="+")
-        widget.bind("<Leave>", lambda _event: apply(widget, ""), add="+")
+        current = widget
+        while current is not None:
+            if getattr(current, "enabled", True) is False:
+                return False
+            try:
+                state = current.cget("state")
+            except Exception:
+                state = None
+            if str(state).lower() == "disabled":
+                return False
+            current = getattr(current, "master", None)
+    except Exception:
+        return True
+    return True
+
+
+def _configure_cursor(widget: tkinter.Misc, cursor: str) -> None:
+    """只在目标指针发生变化时写入，避免 CTk 在悬停期间反复重绘。"""
+    try:
+        current = getattr(widget, "_assfun_cursor", None)
+        if current == cursor:
+            return
+        widget.configure(cursor=cursor)
+        setattr(widget, "_assfun_cursor", cursor)
     except Exception:
         pass
-    apply(widget, "")
+
+
+def apply_interactive_cursor(widget: tkinter.Misc, cursor: str = "hand2") -> None:
+    _configure_cursor(
+        widget, cursor if _widget_is_interactive(widget) else DISABLED_CURSOR
+    )
+
+
+def set_pointer_cursor(widget: tkinter.Misc, cursor: str = "hand2") -> None:
+    """绑定轻量指针反馈。
+
+    不在 <Motion> 中刷新 cursor，也不递归配置子控件，避免 CustomTkinter 控件
+    在悬停期间持续触发 redraw，造成尺寸抖动或闪烁。
+    """
+    try:
+        widget.bind(
+            "<Enter>", lambda _event: apply_interactive_cursor(widget, cursor), add="+"
+        )
+        widget.bind("<Leave>", lambda _event: _configure_cursor(widget, ""), add="+")
+    except Exception:
+        pass
+    _configure_cursor(widget, "")
 
 
 def _is_descendant_widget(widget: tkinter.Misc, root: tkinter.Misc) -> bool:
@@ -1328,6 +1360,112 @@ def widget_contains_pointer(widget: tkinter.Misc) -> bool:
         return False
 
 
+def widget_area(widget: tkinter.Misc) -> int:
+    try:
+        return max(1, int(widget.winfo_width())) * max(1, int(widget.winfo_height()))
+    except Exception:
+        return 1 << 30
+
+
+def widget_under_pointer(widget: tkinter.Misc) -> tkinter.Misc | None:
+    """返回当前鼠标下方的实际 Tk 控件。"""
+    try:
+        if not widget.winfo_exists():
+            return None
+        return widget.winfo_containing(widget.winfo_pointerx(), widget.winfo_pointery())
+    except Exception:
+        return None
+
+
+def ancestor_distance(widget: tkinter.Misc | None, ancestor: tkinter.Misc) -> int:
+    """返回 widget 到 ancestor 的父级距离；不是祖先时返回极大值。"""
+    if widget is None:
+        return 1 << 30
+    try:
+        distance = 0
+        current = widget
+        while current is not None:
+            if current == ancestor:
+                return distance
+            current = current.master
+            distance += 1
+    except Exception:
+        pass
+    return 1 << 30
+
+
+class TooltipRegistry:
+    """全局悬停提示仲裁器。
+
+    同一时间只允许一个 Tooltip 存在。父容器与子控件都有提示时，
+    按鼠标下方实际控件到提示根控件的父级距离排序：
+    鼠标在大容器空白处时显示大容器提示，鼠标进入小控件时显示小控件提示。
+    面积只作为距离相同的兜底排序，不再作为主要判断依据。
+    """
+
+    active: "HoverTooltip | None" = None
+    pending: list["HoverTooltip"] = []
+    counter: int = 0
+
+    @classmethod
+    def owner_from_pointer(cls, reference: tkinter.Misc) -> "HoverTooltip | None":
+        """返回鼠标实际命中链路上最近的 Tooltip 所有者。"""
+        pointer_widget = widget_under_pointer(reference)
+        current = pointer_widget
+        try:
+            while current is not None:
+                tip = getattr(current, "_assfun_tooltip_owner", None)
+                if isinstance(tip, HoverTooltip) and tip._is_available():
+                    return tip
+                current = getattr(current, "master", None)
+        except Exception:
+            return None
+        return None
+
+    @classmethod
+    def schedule(cls, tip: "HoverTooltip") -> None:
+        cls.counter += 1
+        tip._schedule_order = cls.counter
+        if tip not in cls.pending:
+            cls.pending.append(tip)
+        if cls.active is not None and cls.active is not tip:
+            cls.active._force_hide(unregister=True)
+
+    @classmethod
+    def discard(cls, tip: "HoverTooltip") -> None:
+        cls.pending = [item for item in cls.pending if item is not tip]
+        if cls.active is tip:
+            cls.active = None
+
+    @classmethod
+    def best(cls) -> "HoverTooltip | None":
+        candidates: list["HoverTooltip"] = []
+        for tip in list(cls.pending):
+            if tip._is_available() and widget_contains_pointer(tip.root):
+                candidates.append(tip)
+            else:
+                cls.discard(tip)
+        if not candidates:
+            return None
+
+        pointer_widget = widget_under_pointer(candidates[0].root)
+        return min(
+            candidates,
+            key=lambda tip: (
+                ancestor_distance(pointer_widget, tip.root),
+                widget_area(tip.root),
+                -tip._schedule_order,
+            ),
+        )
+
+    @classmethod
+    def activate(cls, tip: "HoverTooltip") -> None:
+        if cls.active is not None and cls.active is not tip:
+            cls.active._force_hide(unregister=True)
+        cls.active = tip
+        cls.pending = [item for item in cls.pending if item is not tip]
+
+
 # 悬停提示
 class HoverTooltip:
     def __init__(
@@ -1350,6 +1488,12 @@ class HoverTooltip:
         self._job: str | None = None
         self._watch_job: str | None = None
         self._tip: tkinter.Toplevel | None = None
+        self._schedule_order = 0
+        self._last_pointer_xy: tuple[int, int] | None = None
+        try:
+            setattr(self.root, "_assfun_tooltip_owner", self)
+        except Exception:
+            pass
         if bind:
             self.bind_to(widget)
 
@@ -1365,10 +1509,51 @@ class HoverTooltip:
         except Exception:
             pass
 
-    def _schedule(self, _event=None) -> None:
-        if not self.text:
+    def _capture_pointer(self, event=None) -> tuple[int, int]:
+        """记录并返回当前鼠标屏幕坐标。
+
+        优先使用事件自带的 x_root / y_root；这比用某个绑定控件读取
+        winfo_pointerx/y 更稳定，尤其是图标按钮、Canvas 子部件和 DPI 缩放场景。
+        """
+        try:
+            if (
+                event is not None
+                and hasattr(event, "x_root")
+                and hasattr(event, "y_root")
+            ):
+                xy = (int(event.x_root), int(event.y_root))
+                self._last_pointer_xy = xy
+                return xy
+        except Exception:
+            pass
+        try:
+            xy = (int(self.root.winfo_pointerx()), int(self.root.winfo_pointery()))
+            self._last_pointer_xy = xy
+            return xy
+        except Exception:
+            pass
+        if self._last_pointer_xy is not None:
+            return self._last_pointer_xy
+        return (0, 0)
+
+    def _is_available(self) -> bool:
+        return bool(
+            self.text
+            and _widget_is_interactive(self.widget)
+            and _widget_is_interactive(self.root)
+        )
+
+    def _schedule(self, event=None) -> None:
+        self._capture_pointer(event)
+        if not self._is_available():
+            self._force_hide()
+            return
+        owner = TooltipRegistry.owner_from_pointer(self.root)
+        if owner is not None and owner is not self:
+            self._force_hide()
             return
         self._cancel_job()
+        TooltipRegistry.schedule(self)
         try:
             self._job = self.widget.after(self.delay_ms, self._show)
         except Exception:
@@ -1378,14 +1563,23 @@ class HoverTooltip:
         self._job = None
         if (
             self._tip is not None
-            or not self.text
+            or not self._is_available()
             or not widget_contains_pointer(self.root)
         ):
+            TooltipRegistry.discard(self)
+            return
+        owner = TooltipRegistry.owner_from_pointer(self.root)
+        if owner is not None and owner is not self:
+            TooltipRegistry.discard(self)
+            return
+        if TooltipRegistry.best() is not self:
+            TooltipRegistry.discard(self)
             return
         try:
+            TooltipRegistry.activate(self)
             self._tip = tkinter.Toplevel(self.widget)
+            self._tip.withdraw()
             self._tip.wm_overrideredirect(True)
-            self._tip.wm_geometry("+0+-10000")
             try:
                 self._tip.attributes("-topmost", True)
             except Exception:
@@ -1405,30 +1599,52 @@ class HoverTooltip:
             )
             label.pack()
             self._position_tip()
+            self._tip.deiconify()
             self._watch_pointer()
         except Exception:
             self._tip = None
+            TooltipRegistry.discard(self)
 
     def _tooltip_position(self) -> tuple[int, int]:
-        px = self.widget.winfo_pointerx()
-        py = self.widget.winfo_pointery()
+        px, py = self._capture_pointer()
         try:
             self._tip.update_idletasks()
         except Exception:
             pass
         tip_w = max(1, self._tip.winfo_reqwidth())
         tip_h = max(1, self._tip.winfo_reqheight())
-        screen_w = max(1, self.widget.winfo_screenwidth())
-        screen_h = max(1, self.widget.winfo_screenheight())
 
-        x = px + 12
-        y = py - tip_h - 14
-        if y < 4:
-            y = py + 18
+        try:
+            screen_left = int(self.widget.winfo_vrootx())
+            screen_top = int(self.widget.winfo_vrooty())
+            screen_right = screen_left + int(self.widget.winfo_vrootwidth())
+            screen_bottom = screen_top + int(self.widget.winfo_vrootheight())
+        except Exception:
+            screen_left = 0
+            screen_top = 0
+            screen_right = max(1, int(self.widget.winfo_screenwidth()))
+            screen_bottom = max(1, int(self.widget.winfo_screenheight()))
 
-        x = max(4, min(x, screen_w - tip_w - 4))
-        y = max(4, min(y, screen_h - tip_h - 4))
-        return x, y
+        gap_x = 12
+        gap_y = 14
+        x = px + gap_x
+        y = py - tip_h - gap_y
+
+        if y < screen_top + 4:
+            y = py + gap_y + 4
+
+        if screen_top <= py <= screen_bottom and y + tip_h > screen_bottom - 4:
+            candidate = py - tip_h - gap_y
+            if candidate >= screen_top + 4:
+                y = candidate
+
+        if screen_right > screen_left and x + tip_w > screen_right - 4:
+            x = px - tip_w - gap_x
+        if x < screen_left + 4:
+            x = screen_left + 4
+        if y < screen_top + 4:
+            y = screen_top + 4
+        return int(x), int(y)
 
     def _position_tip(self) -> None:
         if self._tip is None:
@@ -1446,10 +1662,19 @@ class HoverTooltip:
         if not widget_contains_pointer(self.root):
             self._force_hide()
 
-    def _watch_pointer(self, _event=None) -> None:
+    def _watch_pointer(self, event=None) -> None:
+        self._capture_pointer(event)
         if self._tip is None:
             return
-        if not widget_contains_pointer(self.root):
+        owner = TooltipRegistry.owner_from_pointer(self.root)
+        if owner is not None and owner is not self:
+            self._force_hide()
+            try:
+                owner._schedule()
+            except Exception:
+                pass
+            return
+        if not self._is_available() or not widget_contains_pointer(self.root):
             self._force_hide()
             return
         try:
@@ -1463,7 +1688,7 @@ class HoverTooltip:
         except Exception:
             self._watch_job = None
 
-    def _force_hide(self, _event=None) -> None:
+    def _force_hide(self, _event=None, *, unregister: bool = True) -> None:
         self._cancel_job()
         self._cancel_watch_job()
         if self._tip is not None:
@@ -1472,6 +1697,8 @@ class HoverTooltip:
             except Exception:
                 pass
             self._tip = None
+        if unregister:
+            TooltipRegistry.discard(self)
 
     def _cancel_job(self) -> None:
         if self._job is not None:
@@ -1504,6 +1731,13 @@ def attach_tooltip_tree(widget: tkinter.Misc, tooltip: str | None) -> None:
     refs.append(tip)
 
     def walk(target: tkinter.Misc) -> None:
+        existing_owner = getattr(target, "_assfun_tooltip_owner", None)
+        if (
+            target is not widget
+            and isinstance(existing_owner, HoverTooltip)
+            and existing_owner is not tip
+        ):
+            return
         tip.bind_to(target)
         try:
             children = target.winfo_children()
@@ -2122,11 +2356,29 @@ class ToggleCard(ctk.CTkFrame):
             widget.bind("<Button-1>", self._clicked, add="+")
             widget.bind("<Enter>", self._enter, add="+")
             widget.bind("<Leave>", self._leave, add="+")
-            widget.configure(cursor="hand2")
+            widget.configure(cursor="hand2" if self.enabled else "")
         except Exception:
             pass
         for child in widget.winfo_children():
             self._bind_click_tree(child)
+
+    def _apply_cursor_tree(self, widget: tkinter.Misc | None = None) -> None:
+        widget = widget or self
+        try:
+            widget.configure(cursor="hand2" if self.enabled else "")
+        except tkinter.TclError:
+            try:
+                widget.configure(cursor="")
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            children = widget.winfo_children()
+        except Exception:
+            children = []
+        for child in children:
+            self._apply_cursor_tree(child)
 
     def _clicked(self, _event: Any = None) -> str:
         if self.enabled:
@@ -2151,6 +2403,13 @@ class ToggleCard(ctk.CTkFrame):
             self.refresh(animate=False if not animate else True)
             return
         self.enabled = enabled
+        self._apply_cursor_tree()
+        if not enabled:
+            for ref in getattr(self, "_hover_tooltip_refs", []):
+                try:
+                    ref._force_hide()
+                except Exception:
+                    pass
         self.refresh(animate=animate)
 
     def set_value(
@@ -3925,7 +4184,6 @@ class ASSFunUI(DnDCTk):
             command=self.start_request,
         )
         self.start_button.grid(row=0, column=2, sticky="e")
-        attach_interactive_feedback(self.start_button, "按当前输入与设置开始处理。")
 
     def _init_runtime(self) -> None:
         self.log("-- 日志记录 --")
@@ -4464,6 +4722,7 @@ class ASSFunUI(DnDCTk):
                         hover_color=THEME["disabled"],
                         text_color_disabled=TEXT_MUTED,
                     )
+                    apply_interactive_cursor(self.start_button)
                 else:
                     self.start_button.configure(
                         state="normal",
@@ -4472,6 +4731,7 @@ class ASSFunUI(DnDCTk):
                         hover_color=ACCENT_HOVER,
                         text_color=TEXT,
                     )
+                    apply_interactive_cursor(self.start_button)
         except tkinter.TclError:
             return
 
